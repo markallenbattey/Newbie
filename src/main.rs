@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::io::{self, BufRead, BufReader};
+use std::io::{BufRead, BufReader};
 use std::fs::File;
 use std::path::Path;
 use std::process::{Command as StdCommand, Stdio};
@@ -11,6 +11,10 @@ use std::env;
 use std::process;
 use std::net::TcpStream;
 use std::time::{SystemTime, UNIX_EPOCH};
+use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
+use std::path::PathBuf;
+
 
 // CRITICAL MEMORY CONSTRAINT: NEVER use Vec for data processing!
 // Vec expands memory unpredictably on large datasets. Always use:
@@ -419,6 +423,84 @@ fn list_global_vars() -> [Option<(String, String)>; 64] {
     buffer
 }
 
+/// Initialize the readline editor with history
+pub fn init_editor() -> rustyline::Result<DefaultEditor> {
+    let mut rl = DefaultEditor::new()?;
+    
+    // Load history file if it exists
+    if let Some(history_path) = get_history_path() {
+        // Ignore errors when loading history (file might not exist yet)
+        let _ = rl.load_history(&history_path);
+    }
+    
+    Ok(rl)
+}
+
+// ...existing get_history_path() is declared earlier; keep single definition above
+
+/// Save history to file
+pub fn save_history(rl: &mut DefaultEditor) -> rustyline::Result<()> {
+    if let Some(history_path) = get_history_path() {
+        rl.save_history(&history_path)?;
+    }
+    Ok(())
+}
+
+/// Main REPL loop
+pub fn repl_loop() -> rustyline::Result<()> {
+    let mut rl = init_editor()?;
+    
+    println!("Newbie Interpreter v0.1.0");
+    println!("Type 'exit' or 'quit' to exit, Ctrl+D also works");
+    
+    loop {
+        let readline = rl.readline("newbie> ");
+        
+        match readline {
+            Ok(line) => {
+                let line = line.trim();
+                
+                // Skip empty lines
+                if line.is_empty() {
+                    continue;
+                }
+                
+                // Add to history
+                rl.add_history_entry(line)?;
+                
+                // Handle exit commands
+                if line == "exit" || line == "quit" {
+                    break;
+                }
+                
+                // TODO: Replace this with your actual interpreter logic
+                match eval_line(line) {
+                    Ok(result) => println!("{}", result),
+                    Err(e) => eprintln!("Error: {}", e),
+                }
+            }
+            Err(ReadlineError::Interrupted) => {
+                // Ctrl+C
+                println!("^C");
+                continue;
+            }
+            Err(ReadlineError::Eof) => {
+                // Ctrl+D
+                println!("exit");
+                break;
+            }
+            Err(err) => {
+                eprintln!("Error: {:?}", err);
+                break;
+            }
+        }
+    }
+    
+    // Save history before exiting
+    save_history(&mut rl)?;
+    
+    Ok(())
+}
 // Recursion management
 fn check_recursion_limit() -> Result<(), Box<dyn Error>> {
     RECURSION_DEPTH.with(|depth| {
@@ -535,6 +617,13 @@ pub fn parse_and_execute_line(input: &str) -> Result<(), Box<dyn Error>> {
     
     // Normal parsing path with fixed-size buffer
     parse_tokens_fixed_size(&tokens, token_count, command)
+}
+
+// Minimal wrapper used by legacy REPL code paths. Returns a human-readable result.
+fn eval_line(line: &str) -> Result<String, Box<dyn Error>> {
+    // Delegate to new parser/executor. On success, return OK message (or empty string).
+    parse_and_execute_line(line)?;
+    Ok(String::new())
 }
 
 // Context-aware detection of set vs get operations
@@ -1737,28 +1826,55 @@ fn execute_delete_command(file_path: &str, command: &Command) -> Result<(), Box<
     Ok(())
 }
 
+/// Get the path to the history file
+fn get_history_path() -> Option<PathBuf> {
+    dirs::data_dir().map(|mut path| {
+        path.push("newbie");
+        std::fs::create_dir_all(&path).ok();
+        path.push("history.txt");
+        path
+    })
+}
+
 // Main interactive loop
+// Main interactive loop - replace your existing main() with this
 fn main() -> Result<(), Box<dyn Error>> {
+    // Initialize rustyline editor
+    let mut rl = DefaultEditor::new()?;
+    
+    // Load history file if it exists
+    if let Some(history_path) = get_history_path() {
+        let _ = rl.load_history(&history_path);
+    }
+    
     println!("Newbie Shell v0.4.1 - BASH Support & Silent Execution");
-    println!("Type '&exit' to quit");
+    println!("Type '&exit' to quit, or use Ctrl+D");
     println!("Examples:");
     println!("  &run BASH echo 'Hello World'    # Execute bash command");
-    let stdin = io::stdin();
     println!("  &show &run BASH ls -la           # Execute and display output");
     println!("  &show src/main.rs &first 10      # Show first 10 lines");
     println!("  &run script.sh                   # Execute script silently");
     
     loop {
-        print!("newbie> ");
-        io::Write::flush(&mut io::stdout())?;
+        let readline = rl.readline("newbie> ");
         
-        let mut line = String::new();
-        match stdin.read_line(&mut line) {
-            Ok(0) => break, // EOF
-            Ok(_) => {
+        match readline {
+            Ok(line) => {
                 let trimmed = line.trim();
+                
+                // Skip empty lines
                 if trimmed.is_empty() {
                     continue;
+                }
+                
+                // Add to history
+                if let Err(e) = rl.add_history_entry(trimmed) {
+                    eprintln!("Warning: Could not add to history: {}", e);
+                }
+                
+                // Handle exit command
+                if trimmed == "&exit" {
+                    break;
                 }
                 
                 // Parse and execute the line
@@ -1766,10 +1882,27 @@ fn main() -> Result<(), Box<dyn Error>> {
                     println!("Error: {}", e);
                 }
             }
-            Err(e) => {
-                println!("Error reading input: {}", e);
+            Err(ReadlineError::Interrupted) => {
+                // Ctrl+C - just show ^C and continue
+                println!("^C");
+                continue;
+            }
+            Err(ReadlineError::Eof) => {
+                // Ctrl+D - exit gracefully
+                println!("exit");
                 break;
             }
+            Err(err) => {
+                eprintln!("Error: {:?}", err);
+                break;
+            }
+        }
+    }
+    
+    // Save history before exiting
+    if let Some(history_path) = get_history_path() {
+        if let Err(e) = rl.save_history(&history_path) {
+            eprintln!("Warning: Could not save history: {}", e);
         }
     }
     
