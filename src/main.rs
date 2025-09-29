@@ -1,0 +1,1777 @@
+use std::error::Error;
+use std::fmt;
+use std::fs;
+use std::io::{self, BufRead, BufReader};
+use std::fs::File;
+use std::path::Path;
+use std::process::{Command as StdCommand, Stdio};
+use std::collections::HashMap;
+use std::cell::RefCell;
+use std::env;
+use std::process;
+use std::net::TcpStream;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+// CRITICAL MEMORY CONSTRAINT: NEVER use Vec for data processing!
+// Vec expands memory unpredictably on large datasets. Always use:
+// - Fixed-size arrays for parsing buffers
+// - Iterators for streaming data
+// - Circular buffers for &last N operations
+// This is essential for the streaming architecture and large file handling.
+
+// Constants for fixed-size buffers and limits
+const MAX_ARGS_PER_KEYWORD: usize = 32;  // Increased for BASH commands
+const MAX_RECURSION_DEPTH: usize = 50;
+const MAX_TOKENS_PER_LINE: usize = 32;
+const MAX_LAST_LINES: usize = 1000; // Reasonable limit for &last N operations
+
+// Variable namespace storage - separate storage for each namespace
+thread_local! {
+    static USER_VARS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    static GLOBAL_VARS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    static CONFIG_VARS: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
+    static RECURSION_DEPTH: RefCell<usize> = RefCell::new(0);
+}
+
+// Core types
+#[derive(Debug, Clone, Copy)]
+pub enum LineOrChar {
+    Lines,
+    Chars,
+}
+
+#[derive(Debug)]
+pub enum ExecutionResult {
+    Continue,
+    Stop,
+}
+
+#[derive(Debug, Clone)]
+enum VariableNamespace {
+    User,        // &v.varname
+    System,      // &system.property (computed)
+    Process,     // &process.property (computed)  
+    Network,     // &network.property (computed)
+    Global,      // &global.varname (persistent)
+    Config,      // &config.setting (persistent)
+}
+
+#[derive(Debug)]
+pub struct NewbieError {
+    message: String,
+}
+
+impl fmt::Display for NewbieError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl Error for NewbieError {}
+
+impl NewbieError {
+    fn new(msg: &str) -> Box<dyn Error> {
+        Box::new(NewbieError {
+            message: msg.to_string(),
+        })
+    }
+}
+
+// Command structure that handlers build up
+#[derive(Debug, Clone)]
+pub struct Command {
+    pub action: Option<String>, // move, copy, show, run, etc.
+    pub source: Option<String>,
+    pub destination: Option<String>,
+    pub first_n: Option<usize>,
+    pub last_n: Option<usize>,
+    pub current_unit: LineOrChar,
+    pub numbered: bool,
+    pub original_numbers: bool,
+    pub raw_mode: bool,
+    pub admin_mode: bool, // For &admin prefix
+    pub capture_output: bool, // For variable assignment context
+    pub display_output: bool, // NEW: For &show prefix (silent by default)
+    pub bash_command: Option<String>, // NEW: For &run BASH commands
+}
+
+impl Command {
+    fn new() -> Self {
+        Command {
+            action: None,
+            source: None,
+            destination: None,
+            first_n: None,
+            last_n: None,
+            current_unit: LineOrChar::Lines,
+            numbered: false,
+            original_numbers: false,
+            raw_mode: false,
+            admin_mode: false,
+            capture_output: false,
+            display_output: false, // Default: silent execution
+            bash_command: None,
+        }
+    }
+}
+
+// Function pointer type for command handlers - now they build commands instead of executing
+type CommandHandler = fn(&[&str], &mut Command) -> Result<ExecutionResult, Box<dyn Error>>;
+
+// Keyword registry entry
+struct KeywordEntry {
+    name: &'static str,
+    handler: CommandHandler,
+}
+
+// Static keyword registry - stays in RAM
+static KEYWORDS: &[KeywordEntry] = &[
+    KeywordEntry { name: "&exit", handler: handle_exit },
+    KeywordEntry { name: "&show", handler: handle_show },
+    KeywordEntry { name: "&find", handler: handle_find },
+    KeywordEntry { name: "&copy", handler: handle_copy },
+    KeywordEntry { name: "&move", handler: handle_move },
+    KeywordEntry { name: "&delete", handler: handle_delete },
+    KeywordEntry { name: "&run", handler: handle_run },
+    KeywordEntry { name: "&first", handler: handle_first },
+    KeywordEntry { name: "&last", handler: handle_last },
+    KeywordEntry { name: "&lines", handler: handle_lines },
+    KeywordEntry { name: "&chars", handler: handle_chars },
+    KeywordEntry { name: "&numbered", handler: handle_numbered },
+    KeywordEntry { name: "&original_numbers", handler: handle_original_numbers },
+    KeywordEntry { name: "&raw", handler: handle_raw },
+    KeywordEntry { name: "&to", handler: handle_to },
+    KeywordEntry { name: "&admin", handler: handle_admin },
+    KeywordEntry { name: "&global", handler: handle_global },
+    // Variable system commands
+    KeywordEntry { name: "&set", handler: handle_set },
+    KeywordEntry { name: "&get", handler: handle_get },
+    KeywordEntry { name: "&vars", handler: handle_vars },
+];
+
+// Variable system functions
+fn parse_variable_reference(var_ref: &str) -> Option<(VariableNamespace, String)> {
+    if let Some(rest) = var_ref.strip_prefix("&v.") {
+        Some((VariableNamespace::User, rest.to_string()))
+    } else if let Some(rest) = var_ref.strip_prefix("&system.") {
+        Some((VariableNamespace::System, rest.to_string()))
+    } else if let Some(rest) = var_ref.strip_prefix("&process.") {
+        Some((VariableNamespace::Process, rest.to_string()))
+    } else if let Some(rest) = var_ref.strip_prefix("&network.") {
+        Some((VariableNamespace::Network, rest.to_string()))
+    } else if let Some(rest) = var_ref.strip_prefix("&global.") {
+        Some((VariableNamespace::Global, rest.to_string()))
+    } else if let Some(rest) = var_ref.strip_prefix("&config.") {
+        Some((VariableNamespace::Config, rest.to_string()))
+    } else {
+        None
+    }
+}
+
+fn set_variable(namespace: VariableNamespace, name: &str, value: &str) -> Result<(), Box<dyn Error>> {
+    match namespace {
+        VariableNamespace::User => {
+            USER_VARS.with(|vars| {
+                vars.borrow_mut().insert(name.to_string(), value.to_string());
+            });
+        },
+        VariableNamespace::Global => {
+            GLOBAL_VARS.with(|vars| {
+                vars.borrow_mut().insert(name.to_string(), value.to_string());
+            });
+        },
+        VariableNamespace::Config => {
+            CONFIG_VARS.with(|vars| {
+                vars.borrow_mut().insert(name.to_string(), value.to_string());
+            });
+        },
+        _ => {
+            return Err(NewbieError::new(&format!("Cannot set {:?} variables - they are read-only", namespace)));
+        }
+    }
+    Ok(())
+}
+
+fn get_variable(namespace: VariableNamespace, name: &str) -> Option<String> {
+    match namespace {
+        VariableNamespace::User => {
+            USER_VARS.with(|vars| vars.borrow().get(name).cloned())
+        },
+        VariableNamespace::Global => {
+            GLOBAL_VARS.with(|vars| vars.borrow().get(name).cloned())
+        },
+        VariableNamespace::Config => {
+            CONFIG_VARS.with(|vars| vars.borrow().get(name).cloned())
+        },
+        VariableNamespace::System => get_system_variable(name),
+        VariableNamespace::Process => get_process_variable(name),
+        VariableNamespace::Network => get_network_variable(name),
+    }
+}
+
+// System variable resolution (query-time)
+fn get_system_variable(name: &str) -> Option<String> {
+    match name {
+        "home" => env::var("HOME").ok(),
+        "user" => env::var("USER").ok(),
+        "shell" => env::var("SHELL").ok(),
+        "path" => env::var("PATH").ok(),
+        "pwd" => env::current_dir().ok().and_then(|p| p.to_str().map(|s| s.to_string())),
+        "hostname" => {
+            env::var("HOSTNAME")
+                .or_else(|_| env::var("HOST"))
+                .ok()
+                .or_else(|| {
+                    StdCommand::new("hostname")
+                        .output()
+                        .ok()
+                        .and_then(|output| {
+                            if output.status.success() {
+                                String::from_utf8(output.stdout).ok()
+                                    .map(|s| s.trim().to_string())
+                            } else {
+                                None
+                            }
+                        })
+                })
+        },
+        "os" => env::consts::OS.to_string().into(),
+        "arch" => env::consts::ARCH.to_string().into(),
+        "timestamp" => {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs().to_string())
+        },
+        "temp" => env::var("TMPDIR")
+            .or_else(|_| env::var("TMP"))
+            .or_else(|_| env::var("TEMP"))
+            .unwrap_or_else(|_| "/tmp".to_string())
+            .into(),
+        _ => None,
+    }
+}
+
+// Process variable resolution (query-time)
+fn get_process_variable(name: &str) -> Option<String> {
+    match name {
+        "pid" => Some(process::id().to_string()),
+        "ppid" => {
+            #[cfg(target_os = "linux")]
+            {
+                std::fs::read_to_string("/proc/self/stat")
+                    .ok()
+                    .and_then(|content| {
+                        content.split_whitespace()
+                            .nth(3)
+                            .map(|s| s.to_string())
+                    })
+            }
+            #[cfg(not(target_os = "linux"))]
+            None
+        },
+        "args" => {
+            // FIXED: Use iterator instead of Vec::collect() for streaming
+            let mut args_string = String::new();
+            for (i, arg) in env::args().enumerate() {
+                if i > 0 { // Skip first arg (program name)
+                    if !args_string.is_empty() {
+                        args_string.push(' ');
+                    }
+                    args_string.push_str(&arg);
+                }
+            }
+            Some(args_string)
+        },
+        "argc" => Some(env::args().len().to_string()),
+        "cwd" => env::current_dir().ok().and_then(|p| p.to_str().map(|s| s.to_string())),
+        _ => None,
+    }
+}
+
+// Network variable resolution (query-time)
+fn get_network_variable(name: &str) -> Option<String> {
+    match name {
+        "connected" => {
+            match TcpStream::connect_timeout(
+                &"8.8.8.8:53".parse().ok()?, 
+                std::time::Duration::from_secs(2)
+            ) {
+                Ok(_) => Some("true".to_string()),
+                Err(_) => Some("false".to_string()),
+            }
+        },
+        "local_ip" => {
+            TcpStream::connect("8.8.8.8:53")
+                .ok()
+                .and_then(|stream| stream.local_addr().ok())
+                .map(|addr| addr.ip().to_string())
+        },
+        _ => None,
+    }
+}
+
+// FIXED: Use fixed-size buffer instead of Vec for variable listing
+fn list_variables_in_namespace(namespace: VariableNamespace) -> [Option<(String, String)>; 64] {
+    let mut buffer: [Option<(String, String)>; 64] = [const { None }; 64];
+    let mut index = 0;
+    
+    match namespace {
+        VariableNamespace::User => {
+            USER_VARS.with(|vars| {
+                for (k, v) in vars.borrow().iter() {
+                    if index < 64 {
+                        buffer[index] = Some((k.clone(), v.clone()));
+                        index += 1;
+                    }
+                }
+            });
+        },
+        VariableNamespace::Global => {
+            GLOBAL_VARS.with(|vars| {
+                for (k, v) in vars.borrow().iter() {
+                    if index < 64 {
+                        buffer[index] = Some((k.clone(), v.clone()));
+                        index += 1;
+                    }
+                }
+            });
+        },
+        VariableNamespace::Config => {
+            CONFIG_VARS.with(|vars| {
+                for (k, v) in vars.borrow().iter() {
+                    if index < 64 {
+                        buffer[index] = Some((k.clone(), v.clone()));
+                        index += 1;
+                    }
+                }
+            });
+        },
+        VariableNamespace::System => {
+            let system_vars = [
+                "home", "user", "shell", "path", "pwd", "hostname", 
+                "os", "arch", "timestamp", "temp"
+            ];
+            for &name in system_vars.iter() {
+                if index < 64 {
+                    if let Some(value) = get_system_variable(name) {
+                        buffer[index] = Some((name.to_string(), value));
+                        index += 1;
+                    }
+                }
+            }
+        },
+        VariableNamespace::Process => {
+            let process_vars = ["pid", "ppid", "args", "argc", "cwd"];
+            for &name in process_vars.iter() {
+                if index < 64 {
+                    if let Some(value) = get_process_variable(name) {
+                        buffer[index] = Some((name.to_string(), value));
+                        index += 1;
+                    }
+                }
+            }
+        },
+        VariableNamespace::Network => {
+            let network_vars = ["connected", "local_ip"];
+            for &name in network_vars.iter() {
+                if index < 64 {
+                    if let Some(value) = get_network_variable(name) {
+                        buffer[index] = Some((name.to_string(), value));
+                        index += 1;
+                    }
+                }
+            }
+        },
+    }
+    
+    buffer
+}
+
+// Legacy global variable operations (for backward compatibility)
+fn set_global_var(name: &str, value: &str) -> Result<(), Box<dyn Error>> {
+    GLOBAL_VARS.with(|vars| {
+        vars.borrow_mut().insert(name.to_string(), value.to_string());
+    });
+    Ok(())
+}
+
+fn get_global_var(name: &str) -> Option<String> {
+    GLOBAL_VARS.with(|vars| {
+        vars.borrow().get(name).cloned()
+    })
+}
+
+// FIXED: Use fixed-size buffer instead of Vec for global variable listing
+fn list_global_vars() -> [Option<(String, String)>; 64] {
+    let mut buffer: [Option<(String, String)>; 64] = [const { None }; 64];
+    let mut index = 0;
+    
+    GLOBAL_VARS.with(|vars| {
+        for (k, v) in vars.borrow().iter() {
+            if index < 64 {
+                buffer[index] = Some((k.clone(), v.clone()));
+                index += 1;
+            }
+        }
+    });
+    
+    buffer
+}
+
+// Recursion management
+fn check_recursion_limit() -> Result<(), Box<dyn Error>> {
+    RECURSION_DEPTH.with(|depth| {
+        let current_depth = *depth.borrow();
+        if current_depth >= MAX_RECURSION_DEPTH {
+            Err(NewbieError::new(&format!(
+                "Maximum recursion depth exceeded ({})", MAX_RECURSION_DEPTH
+            )))
+        } else {
+            Ok(())
+        }
+    })
+}
+
+fn increment_recursion() -> Result<(), Box<dyn Error>> {
+    check_recursion_limit()?;
+    RECURSION_DEPTH.with(|depth| {
+        *depth.borrow_mut() += 1;
+    });
+    Ok(())
+}
+
+fn decrement_recursion() {
+    RECURSION_DEPTH.with(|depth| {
+        let mut d = depth.borrow_mut();
+        if *d > 0 {
+            *d -= 1;
+        }
+    });
+}
+
+// RAII guard to ensure recursion depth is decremented
+struct RecursionGuard;
+
+impl Drop for RecursionGuard {
+    fn drop(&mut self) {
+        decrement_recursion();
+    }
+}
+
+// Keyword lookup function
+fn find_handler(keyword: &str) -> Option<CommandHandler> {
+    KEYWORDS.iter()
+        .find(|entry| entry.name == keyword)
+        .map(|entry| entry.handler)
+}
+
+// Core parsing function - builds command structure then executes
+pub fn parse_and_execute_line(input: &str) -> Result<(), Box<dyn Error>> {
+    // Fixed-size token buffer - prevents memory expansion during .ns file processing
+    let mut tokens: [Option<&str>; MAX_TOKENS_PER_LINE] = [None; MAX_TOKENS_PER_LINE];
+    let mut token_count = 0;
+    
+    // Parse tokens into fixed-size buffer
+    for token in input.split_whitespace() {
+        if token_count >= MAX_TOKENS_PER_LINE {
+            return Err(NewbieError::new("Command line too long - too many tokens"));
+        }
+        tokens[token_count] = Some(token);
+        token_count += 1;
+    }
+    
+    // Build up the complete command structure
+    let command = Command::new();
+    
+    // Check for variable operations syntactically using fixed-size array
+    let mut has_variable_reference = false;
+    let mut var_token_index: Option<usize> = None;
+    let mut has_explicit_get_set = false;
+    
+    for i in 0..token_count {
+        if let Some(token) = tokens[i] {
+            if token == "&set" || token == "&get" {
+                has_explicit_get_set = true;
+            }
+            if token.starts_with("&v.") || token.starts_with("&system.") || 
+               token.starts_with("&process.") || token.starts_with("&network.") ||
+               token.starts_with("&global.") || token.starts_with("&config.") {
+                has_variable_reference = true;
+                if var_token_index.is_none() {
+                    var_token_index = Some(i);
+                }
+            }
+        }
+    }
+    
+    // Auto-detect variable operations if no explicit &set/&get
+    if has_variable_reference && !has_explicit_get_set {
+        if let Some(var_index) = var_token_index {
+            // Check if the variable is being used as an argument to another command
+            let mut is_argument_to_command = false;
+            if var_index > 0 {
+                if let Some(prev_token) = tokens[var_index - 1] {
+                    if prev_token.starts_with('&') && !prev_token.contains('.') {
+                        // Variable is an argument to a keyword command
+                        is_argument_to_command = true;
+                    }
+                }
+            }
+            
+            // Only auto-detect set/get if variable is not an argument to another command
+            if !is_argument_to_command {
+                // Context-aware detection:
+                let is_set_operation = detect_set_context(&tokens, token_count, var_index);
+                
+                return if is_set_operation {
+                    parse_tokens_with_set_prefix(&tokens, token_count, command)
+                } else {
+                    parse_tokens_with_get_prefix(&tokens, token_count, command)
+                };
+            }
+        }
+    }
+    
+    // Normal parsing path with fixed-size buffer
+    parse_tokens_fixed_size(&tokens, token_count, command)
+}
+
+// Context-aware detection of set vs get operations
+fn detect_set_context(
+    tokens: &[Option<&str>; MAX_TOKENS_PER_LINE], 
+    token_count: usize, 
+    var_index: usize
+) -> bool {
+    // Pattern 1: &v.varname = value (assignment with equals)
+    if var_index + 2 < token_count {
+        if let (Some(_var_token), Some(equals_token), Some(_value_token)) = 
+            (tokens[var_index], tokens[var_index + 1], tokens[var_index + 2]) {
+            if equals_token == "=" {
+                return true;
+            }
+        }
+    }
+    
+    // Pattern 2: &v.varname value (assignment without equals)
+    if var_index + 1 < token_count {
+        if let Some(next_token) = tokens[var_index + 1] {
+            // If next token is not a keyword and not equals, it's likely a value
+            if !next_token.starts_with('&') && next_token != "=" {
+                return true;
+            }
+        }
+    }
+    
+    // Pattern 3: Check if variable is preceded by a command that needs input
+    // &show &v.varname -> GET (show needs to read the variable)
+    // &v.var2 = &v.varname -> var2 is SET, varname is GET
+    if var_index > 0 {
+        if let Some(prev_token) = tokens[var_index - 1] {
+            match prev_token {
+                "&show" | "&find" | "&copy" | "&move" | "&run" => {
+                    // These commands read variables, so this is a GET
+                    return false;
+                }
+                "=" => {
+                    // Variable after equals is being read (GET)
+                    return false;
+                }
+                _ => {}
+            }
+        }
+    }
+    
+    // Pattern 4: If we're at the beginning and followed by assignment
+    if var_index == 0 {
+        // Check for assignment patterns
+        if var_index + 1 < token_count {
+            if let Some(next_token) = tokens[var_index + 1] {
+                if next_token == "=" || (!next_token.starts_with('&') && next_token != "=") {
+                    return true; // Assignment
+                }
+            }
+        }
+    }
+    
+    // Default: if no clear assignment pattern, assume GET
+    false
+}
+
+fn parse_tokens_with_set_prefix(
+    tokens: &[Option<&str>; MAX_TOKENS_PER_LINE], 
+    token_count: usize, 
+    command: Command
+) -> Result<(), Box<dyn Error>> {
+    // Create a new token array with "&set" prefix
+    let mut new_tokens: [Option<&str>; MAX_TOKENS_PER_LINE] = [None; MAX_TOKENS_PER_LINE];
+    new_tokens[0] = Some("&set");
+    
+    // Copy existing tokens, checking bounds
+    let copy_count = std::cmp::min(token_count, MAX_TOKENS_PER_LINE - 1);
+    for i in 0..copy_count {
+        new_tokens[i + 1] = tokens[i];
+    }
+    
+    parse_tokens_fixed_size(&new_tokens, copy_count + 1, command)
+}
+
+fn parse_tokens_with_get_prefix(
+    tokens: &[Option<&str>; MAX_TOKENS_PER_LINE], 
+    token_count: usize, 
+    command: Command
+) -> Result<(), Box<dyn Error>> {
+    // Create a new token array with "&get" prefix  
+    let mut new_tokens: [Option<&str>; MAX_TOKENS_PER_LINE] = [None; MAX_TOKENS_PER_LINE];
+    new_tokens[0] = Some("&get");
+    
+    // Copy existing tokens, checking bounds
+    let copy_count = std::cmp::min(token_count, MAX_TOKENS_PER_LINE - 1);
+    for i in 0..copy_count {
+        new_tokens[i + 1] = tokens[i];
+    }
+    
+    parse_tokens_fixed_size(&new_tokens, copy_count + 1, command)
+}
+
+fn parse_tokens_fixed_size(
+    tokens: &[Option<&str>; MAX_TOKENS_PER_LINE], 
+    token_count: usize, 
+    mut command: Command
+) -> Result<(), Box<dyn Error>> {
+    // Fixed-size storage for parsing - prevents memory expansion on large datasets
+    let mut current_keyword: Option<&str> = None;
+    let mut current_args: [Option<&str>; MAX_ARGS_PER_KEYWORD] = [None; MAX_ARGS_PER_KEYWORD];
+    let mut arg_count = 0;
+    
+    for i in 0..token_count {
+        if let Some(token) = tokens[i] {
+            if token.starts_with('&') && !token.contains('.') {
+                // Process previous keyword if exists (only for actual keywords, not variable references)
+                if let Some(keyword) = current_keyword.take() {
+                    // FIXED: Create slice directly from fixed buffer - NO Vec!
+                    let mut args_slice: [&str; MAX_ARGS_PER_KEYWORD] = [""; MAX_ARGS_PER_KEYWORD];
+                    let mut valid_count = 0;
+                    
+                    for j in 0..arg_count {
+                        if let Some(arg) = current_args[j] {
+                            args_slice[valid_count] = arg;
+                            valid_count += 1;
+                        }
+                    }
+                    
+                    // Pass slice directly to handler - NO Vec creation
+                    if let Some(handler) = find_handler(keyword) {
+                        handler(&args_slice[..valid_count], &mut command)?;
+                    } else {
+                        return Err(NewbieError::new(&format!("Unknown keyword: {}", keyword)));
+                    }
+                    
+                    // Reset args buffer
+                    current_args = [None; MAX_ARGS_PER_KEYWORD];
+                    arg_count = 0;
+                }
+                
+                // Start new keyword
+                current_keyword = Some(token);
+            } else {
+                // Add argument to current keyword
+                if arg_count < MAX_ARGS_PER_KEYWORD {
+                    current_args[arg_count] = Some(token);
+                    arg_count += 1;
+                } else {
+                    return Err(NewbieError::new("Too many arguments for keyword"));
+                }
+            }
+        }
+    }
+    
+    // Process final keyword
+    if let Some(keyword) = current_keyword {
+        // FIXED: Create slice directly from fixed buffer - NO Vec!
+        let mut args_slice: [&str; MAX_ARGS_PER_KEYWORD] = [""; MAX_ARGS_PER_KEYWORD];
+        let mut valid_count = 0;
+        
+        for j in 0..arg_count {
+            if let Some(arg) = current_args[j] {
+                args_slice[valid_count] = arg;
+                valid_count += 1;
+            }
+        }
+        
+        // Pass slice directly to handler - NO Vec creation
+        if let Some(handler) = find_handler(keyword) {
+            handler(&args_slice[..valid_count], &mut command)?;
+        } else {
+            return Err(NewbieError::new(&format!("Unknown keyword: {}", keyword)));
+        }
+    }
+    
+    // Now execute the complete command
+    execute_command(&command)
+}
+
+// Expand tilde (~) to home directory
+fn expand_tilde(path: &str) -> String {
+    if path.starts_with('~') {
+        if let Ok(home) = std::env::var("HOME") {
+            path.replacen('~', &home, 1)
+        } else {
+            path.to_string() // fallback if HOME not set
+        }
+    } else {
+        path.to_string()
+    }
+}
+
+// Execute the fully built command
+fn execute_command(command: &Command) -> Result<(), Box<dyn Error>> {
+    match command.action.as_deref() {
+        Some("exit") => {
+            println!("Goodbye!");
+            std::process::exit(0);
+        },
+        
+        Some("run") => {
+            // Handle BASH commands vs script files
+            if let Some(ref bash_cmd) = command.bash_command {
+                // Execute bash command: &run BASH echo 'Hello World'
+                execute_bash_command(bash_cmd, command)?;
+            } else if let Some(ref cmd_path) = command.source {
+                // Execute script or direct command
+                let expanded_path = expand_tilde(cmd_path);
+                
+                // Determine if this is a .ns file or external command
+                if expanded_path.ends_with(".ns") {
+                    execute_newbie_script(&expanded_path, command)?;
+                } else {
+                    execute_external_command(&expanded_path, command)?;
+                }
+            } else {
+                return Err(NewbieError::new("&run requires a command or script"));
+            }
+        },
+        
+        Some("show") => {
+            let file_path = command.source.as_ref()
+                .ok_or_else(|| NewbieError::new("&show requires a file path"))?;
+            
+            let expanded_path = expand_tilde(file_path);
+            
+            if !Path::new(&expanded_path).exists() {
+                return Err(NewbieError::new(&format!("File not found: {}", expanded_path)));
+            }
+            
+            execute_show_command(&expanded_path, command)?;
+        },
+        
+        Some("copy") => {
+            let source_path = command.source.as_ref()
+                .ok_or_else(|| NewbieError::new("&copy requires source"))?;
+            let dest_path = command.destination.as_ref()
+                .ok_or_else(|| NewbieError::new("&copy requires &to destination"))?;
+            
+            execute_copy_command(source_path, dest_path, command)?;
+        },
+        
+        Some("move") => {
+            let source_path = command.source.as_ref()
+                .ok_or_else(|| NewbieError::new("&move requires source"))?;
+            let dest_path = command.destination.as_ref()
+                .ok_or_else(|| NewbieError::new("&move requires &to destination"))?;
+            
+            execute_move_command(source_path, dest_path, command)?;
+        },
+        Some("delete") => {
+            let file_path = command.source.as_ref()
+                .ok_or_else(|| NewbieError::new("&delete requires a file path"))?;
+    
+            execute_delete_command(file_path, command)?;
+        },
+        // Variable system operations
+        Some("set_variable") => {
+            if command.display_output && !command.raw_mode {
+                if let Some(ref var_info) = command.source {
+                    println!("Set {}", var_info);
+                }
+            }
+        },
+        
+        Some("get_variable") => {
+            if command.display_output {
+                if let Some(ref value) = command.destination {
+                    println!("{}", value);
+                } else {
+                    if let Some(ref var_ref) = command.source {
+                        if !command.raw_mode {
+                            println!("Variable '{}' not found", var_ref);
+                        }
+                    }
+                }
+            }
+        },
+        
+        Some("list_all_variables") => {
+            if command.display_output {
+                execute_vars_list_all(command);
+            }
+        },
+        
+        Some("list_namespace_variables") => {
+            if command.display_output {
+                if let Some(ref namespace_name) = command.source {
+                    execute_vars_list_namespace(namespace_name, command)?;
+                }
+            }
+        },
+        
+        // Legacy global variable operations
+        Some("global_list") => {
+            if command.display_output {
+                execute_global_list(command);
+            }
+        },
+        
+        Some("global_get") => {
+            if command.display_output {
+                let var_name = command.source.as_ref()
+                    .ok_or_else(|| NewbieError::new("Missing variable name"))?;
+                execute_global_get(var_name, command);
+            }
+        },
+        
+        Some(action) => {
+            return Err(NewbieError::new(&format!("Unknown action: {}", action)));
+        },
+        
+        None => {
+            return Err(NewbieError::new("No action command specified"));
+        }
+    }
+    
+    Ok(())
+}
+
+// Execute BASH commands - &run BASH echo 'Hello World'
+fn execute_bash_command(bash_cmd: &str, command: &Command) -> Result<(), Box<dyn Error>> {
+    let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+    
+    let mut std_cmd = if command.admin_mode {
+        let mut sudo_cmd = StdCommand::new("sudo");
+        sudo_cmd.arg(&shell).arg("-c").arg(bash_cmd);
+        sudo_cmd
+    } else {
+        let mut shell_cmd = StdCommand::new(&shell);
+        shell_cmd.arg("-c").arg(bash_cmd);
+        shell_cmd
+    };
+    
+    // Configure stdio based on execution context
+    if command.capture_output {
+        // Capture output for variable assignment (silent)
+        std_cmd.stdout(Stdio::piped())
+               .stderr(Stdio::piped());
+        
+        let output = std_cmd.output().map_err(|e|
+            NewbieError::new(&format!("Failed to execute bash command '{}': {}", bash_cmd, e))
+        )?;
+        
+        if !output.status.success() {
+            return Err(NewbieError::new(&format!("Bash command failed with exit code: {}", 
+                output.status.code().unwrap_or(-1))));
+        }
+        
+    } else if !command.display_output {
+        // Silent execution by default - no output unless &show prefix
+        std_cmd.stdout(Stdio::null())
+               .stderr(Stdio::null());
+        
+        let status = std_cmd.status().map_err(|e|
+            NewbieError::new(&format!("Failed to execute bash command '{}': {}", bash_cmd, e))
+        )?;
+        
+        if !status.success() {
+            return Err(NewbieError::new(&format!("Bash command failed with exit code: {}", 
+                status.code().unwrap_or(-1))));
+        }
+        
+    } else {
+        // Display execution - inherit stdio (show output) - only when &show prefix used
+        let status = std_cmd.status().map_err(|e|
+            NewbieError::new(&format!("Failed to execute bash command '{}': {}", bash_cmd, e))
+        )?;
+        
+        if !status.success() {
+            return Err(NewbieError::new(&format!("Bash command failed with exit code: {}", 
+                status.code().unwrap_or(-1))));
+        }
+    }
+    
+    // Clear sudo credentials if admin mode was used
+    if command.admin_mode {
+        let _ = StdCommand::new("sudo").arg("-k").status();
+    }
+    
+    Ok(())
+}
+
+// &show command implementation with streaming architecture
+fn execute_show_command(file_path: &str, command: &Command) -> Result<(), Box<dyn Error>> {
+    let file = File::open(file_path).map_err(|e|
+        NewbieError::new(&format!("Failed to open file {}: {}", file_path, e))
+    )?;
+    
+    let reader = BufReader::new(file);
+    
+    // Handle character-based operations with streaming
+    if matches!(command.current_unit, LineOrChar::Chars) {
+        return execute_show_chars(reader, command);
+    }
+    
+    // Handle line-based operations with streaming
+    if let Some(first_n) = command.first_n {
+        execute_show_first_lines(reader, first_n, command)
+    } else if let Some(last_n) = command.last_n {
+        execute_show_last_lines(reader, last_n, command)
+    } else {
+        execute_show_all_lines(reader, command)
+    }
+}
+
+// Streaming character-based display
+fn execute_show_chars(reader: BufReader<File>, command: &Command) -> Result<(), Box<dyn Error>> {
+    let mut chars_printed = 0;
+    
+    for line_result in reader.lines() {
+        let line = line_result.map_err(|e|
+            NewbieError::new(&format!("Error reading file: {}", e))
+        )?;
+        
+        for ch in line.chars() {
+            // Handle first N chars
+            if let Some(first_n) = command.first_n {
+                if chars_printed >= first_n {
+                    return Ok(());
+                }
+            }
+            
+            // For &last N chars, we need a circular buffer approach
+            if let Some(_last_n) = command.last_n {
+                return Err(NewbieError::new("&last N &chars not yet implemented - use &last N &lines instead"));
+            }
+            
+            print!("{}", ch);
+            chars_printed += 1;
+        }
+        
+        // Add newline between lines
+        if chars_printed < command.first_n.unwrap_or(usize::MAX) {
+            print!("\n");
+            chars_printed += 1;
+        }
+    }
+    
+    Ok(())
+}
+
+// Streaming first N lines
+fn execute_show_first_lines(reader: BufReader<File>, first_n: usize, command: &Command) -> Result<(), Box<dyn Error>> {
+    let mut lines_printed = 0;
+    
+    for line_result in reader.lines() {
+        if lines_printed >= first_n {
+            break;
+        }
+        
+        let line = line_result.map_err(|e|
+            NewbieError::new(&format!("Error reading file: {}", e))
+        )?;
+        
+        if command.numbered {
+            println!("{:6}: {}", lines_printed + 1, line);
+        } else if command.original_numbers {
+            println!("{:6}: {}", lines_printed + 1, line);
+        } else {
+            println!("{}", line);
+        }
+        
+        lines_printed += 1;
+    }
+    
+    Ok(())
+}
+
+// Fixed-size circular buffer for last N lines
+fn execute_show_last_lines(reader: BufReader<File>, last_n: usize, command: &Command) -> Result<(), Box<dyn Error>> {
+    if last_n > MAX_LAST_LINES {
+        return Err(NewbieError::new(&format!("&last {} exceeds maximum of {}", last_n, MAX_LAST_LINES)));
+    }
+    
+    // Fixed-size circular buffer - prevents memory explosion
+    let mut line_buffer: [Option<String>; MAX_LAST_LINES] = {
+        let mut buf: [Option<String>; MAX_LAST_LINES] = unsafe { std::mem::zeroed() };
+        for item in &mut buf {
+            *item = None;
+        }
+        buf
+    };
+    
+    let mut total_lines = 0;
+    let mut buffer_pos = 0;
+    
+    // Fill circular buffer
+    for line_result in reader.lines() {
+        let line = line_result.map_err(|e|
+            NewbieError::new(&format!("Error reading file: {}", e))
+        )?;
+        
+        line_buffer[buffer_pos] = Some(line);
+        buffer_pos = (buffer_pos + 1) % MAX_LAST_LINES;
+        total_lines += 1;
+    }
+    
+    // Calculate starting position for last N lines
+    let lines_to_show = std::cmp::min(last_n, total_lines);
+    let start_line_num = if total_lines > last_n { total_lines - last_n + 1 } else { 1 };
+    
+    let start_pos = if total_lines > MAX_LAST_LINES {
+        buffer_pos
+    } else {
+        if total_lines > last_n { total_lines - last_n } else { 0 }
+    };
+    
+    // Output last N lines from circular buffer
+    for i in 0..lines_to_show {
+        let pos = (start_pos + i) % MAX_LAST_LINES;
+        if let Some(ref line) = line_buffer[pos] {
+            if command.numbered {
+                println!("{:6}: {}", i + 1, line);
+            } else if command.original_numbers {
+                println!("{:6}: {}", start_line_num + i, line);
+            } else {
+                println!("{}", line);
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+// Streaming display of all lines
+fn execute_show_all_lines(reader: BufReader<File>, command: &Command) -> Result<(), Box<dyn Error>> {
+    let mut line_number = 1;
+    
+    for line_result in reader.lines() {
+        let line = line_result.map_err(|e|
+            NewbieError::new(&format!("Error reading file: {}", e))
+        )?;
+        
+        if command.numbered || command.original_numbers {
+            println!("{:6}: {}", line_number, line);
+        } else {
+            println!("{}", line);
+        }
+        
+        line_number += 1;
+    }
+    
+    Ok(())
+}
+
+// &move command implementation
+fn execute_move_command(source_path: &str, dest_path: &str, command: &Command) -> Result<(), Box<dyn Error>> {
+    let expanded_source = expand_tilde(source_path);
+    let expanded_dest = expand_tilde(dest_path);
+    
+    if !Path::new(&expanded_source).exists() {
+        return Err(NewbieError::new(&format!("Source not found: {}", expanded_source)));
+    }
+    
+    let dest_ends_with_slash = expanded_dest.ends_with('/');
+    
+    if dest_ends_with_slash {
+        let dest_dir = expanded_dest.trim_end_matches('/');
+        
+        if !Path::new(dest_dir).exists() {
+            fs::create_dir_all(dest_dir).map_err(|e|
+                NewbieError::new(&format!("Failed to create destination directory {}: {}", dest_dir, e))
+            )?;
+        }
+        
+        let source_filename = Path::new(&expanded_source)
+            .file_name()
+            .ok_or_else(|| NewbieError::new("Could not determine source filename"))?
+            .to_string_lossy();
+        let final_dest = format!("{}/{}", dest_dir, source_filename);
+        
+        fs::rename(&expanded_source, &final_dest).map_err(|e|
+            NewbieError::new(&format!("Failed to move {} to {}: {}", expanded_source, final_dest, e))
+        )?;
+        
+        if command.display_output && !command.raw_mode {
+            println!("Moved {} to {}", source_path, final_dest);
+        }
+    } else {
+        fs::rename(&expanded_source, &expanded_dest).map_err(|e|
+            NewbieError::new(&format!("Failed to move {} to {}: {}", expanded_source, expanded_dest, e))
+        )?;
+        
+        if command.display_output && !command.raw_mode {
+            println!("Moved {} to {}", source_path, dest_path);
+        }
+    }
+    
+    Ok(())
+}
+
+// &copy command implementation (rsync front-end)
+fn execute_copy_command(source_path: &str, dest_path: &str, command: &Command) -> Result<(), Box<dyn Error>> {
+    let expanded_source = expand_tilde(source_path);
+    let expanded_dest = expand_tilde(dest_path);
+    
+    let mut rsync_cmd = if command.admin_mode {
+        let mut sudo_cmd = StdCommand::new("sudo");
+        sudo_cmd.arg("rsync");
+        sudo_cmd
+    } else {
+        StdCommand::new("rsync")
+    };
+    
+    rsync_cmd.arg("-a");
+    rsync_cmd.arg(&expanded_source);
+    rsync_cmd.arg(&expanded_dest);
+    
+    if !command.display_output {
+        rsync_cmd.stdout(Stdio::null())
+                 .stderr(Stdio::null());
+    }
+    
+    let status = rsync_cmd.status().map_err(|e|
+        NewbieError::new(&format!("Failed to execute rsync: {}", e))
+    )?;
+    
+    if !status.success() {
+        return Err(NewbieError::new(&format!("rsync failed with exit code: {}", 
+            status.code().unwrap_or(-1))));
+    }
+    
+    if command.display_output && !command.raw_mode {
+        println!("Copied {} to {}", source_path, dest_path);
+    }
+    
+    if command.admin_mode {
+        let _ = StdCommand::new("sudo").arg("-k").status();
+    }
+    
+    Ok(())
+}
+
+// FIXED: Variable system display functions with fixed-size buffers
+fn execute_vars_list_all(command: &Command) {
+    let namespaces = [
+        (VariableNamespace::User, "User variables (&v.)"),
+        (VariableNamespace::System, "System variables (&system.)"),
+        (VariableNamespace::Process, "Process variables (&process.)"),
+        (VariableNamespace::Network, "Network variables (&network.)"),
+        (VariableNamespace::Global, "Global variables (&global.)"),
+        (VariableNamespace::Config, "Config variables (&config.)"),
+    ];
+    
+    for (namespace, title) in &namespaces {
+        let vars = list_variables_in_namespace(namespace.clone());
+        let mut has_vars = false;
+        
+        // Check if we have any variables
+        for var_opt in &vars {
+            if var_opt.is_some() {
+                has_vars = true;
+                break;
+            }
+        }
+        
+        if has_vars || !command.raw_mode {
+            if !command.raw_mode {
+                println!("{}:", title);
+            }
+            for var_opt in &vars {
+                if let Some((name, value)) = var_opt {
+                    if command.raw_mode {
+                        println!("{}={}", name, value);
+                    } else {
+                        println!("  {}: {}", name, value);
+                    }
+                }
+            }
+            if !command.raw_mode && has_vars {
+                println!();
+            }
+        }
+    }
+}
+
+fn execute_vars_list_namespace(namespace_name: &str, command: &Command) -> Result<(), Box<dyn Error>> {
+    let namespace = match namespace_name {
+        "v" | "user" => VariableNamespace::User,
+        "system" => VariableNamespace::System,
+        "process" => VariableNamespace::Process,
+        "network" => VariableNamespace::Network,
+        "global" => VariableNamespace::Global,
+        "config" => VariableNamespace::Config,
+        _ => return Err(NewbieError::new(&format!("Unknown namespace: {}", namespace_name))),
+    };
+    
+    let vars = list_variables_in_namespace(namespace);
+    let mut has_vars = false;
+    
+    // Check if we have any variables
+    for var_opt in &vars {
+        if var_opt.is_some() {
+            has_vars = true;
+            break;
+        }
+    }
+    
+    if !has_vars {
+        if !command.raw_mode {
+            println!("No variables in {} namespace", namespace_name);
+        }
+    } else {
+        if !command.raw_mode {
+            println!("Variables in {} namespace:", namespace_name);
+        }
+        for var_opt in &vars {
+            if let Some((name, value)) = var_opt {
+                if command.raw_mode {
+                    println!("{}={}", name, value);
+                } else {
+                    println!("  {}: {}", name, value);
+                }
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+fn execute_global_list(command: &Command) {
+    let vars = list_global_vars();
+    let mut has_vars = false;
+    
+    // Check if we have any variables
+    for var_opt in &vars {
+        if var_opt.is_some() {
+            has_vars = true;
+            break;
+        }
+    }
+    
+    if !has_vars {
+        if !command.raw_mode {
+            println!("No global variables set");
+        }
+    } else {
+        if !command.raw_mode {
+            println!("Global variables:");
+        }
+        for var_opt in &vars {
+            if let Some((name, value)) = var_opt {
+                if command.raw_mode {
+                    println!("{}={}", name, value);
+                } else {
+                    println!("  {}: {}", name, value);
+                }
+            }
+        }
+    }
+}
+
+fn execute_global_get(var_name: &str, command: &Command) {
+    match get_global_var(var_name) {
+        Some(value) => println!("{}", value),
+        None => {
+            if !command.raw_mode {
+                println!("Global variable '{}' not found", var_name);
+            }
+        }
+    }
+}
+
+// Execute a .ns newbie script file with recursion protection
+fn execute_newbie_script(script_path: &str, command: &Command) -> Result<(), Box<dyn Error>> {
+    increment_recursion()?;
+    let _recursion_guard = RecursionGuard;
+    
+    if !Path::new(script_path).exists() {
+        return Err(NewbieError::new(&format!("Script not found: {}", script_path)));
+    }
+    
+    let file = File::open(script_path).map_err(|e|
+        NewbieError::new(&format!("Failed to open script {}: {}", script_path, e))
+    )?;
+    
+    let reader = BufReader::new(file);
+    let mut line_number = 0;
+    
+    // STREAMING: Process .ns file line by line without storing entire file in memory
+    for line_result in reader.lines() {
+        line_number += 1;
+        
+        let line = line_result.map_err(|e|
+            NewbieError::new(&format!("Error reading line {} in {}: {}", line_number, script_path, e))
+        )?;
+        
+        let trimmed_line = line.trim();
+        
+        if trimmed_line.is_empty() {
+            continue;
+        }
+        
+        if !trimmed_line.starts_with('&') {
+            continue;
+        }
+        
+        if let Err(e) = parse_and_execute_line(trimmed_line) {
+            if command.display_output && !command.raw_mode {
+                eprintln!("Error in {}:{}: {}", script_path, line_number, e);
+            }
+            continue;
+        }
+    }
+    
+    if command.display_output && !command.raw_mode && !command.capture_output {
+        println!("Script completed: {}", script_path);
+    }
+    
+    Ok(())
+}
+
+// Execute an external command or script
+fn execute_external_command(cmd_path: &str, command: &Command) -> Result<(), Box<dyn Error>> {
+    let mut std_cmd = if command.admin_mode {
+        let mut sudo_cmd = StdCommand::new("sudo");
+        
+        if cmd_path.ends_with(".sh") {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+            sudo_cmd.arg(&shell).arg(cmd_path);
+        } else {
+            sudo_cmd.arg(cmd_path);
+        }
+        sudo_cmd
+    } else {
+        if cmd_path.ends_with(".sh") {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+            let mut shell_cmd = StdCommand::new(&shell);
+            shell_cmd.arg(cmd_path);
+            shell_cmd
+        } else {
+            StdCommand::new(cmd_path)
+        }
+    };
+    
+    if command.capture_output {
+        std_cmd.stdout(Stdio::piped())
+               .stderr(Stdio::piped());
+        
+        let output = std_cmd.output().map_err(|e|
+            NewbieError::new(&format!("Failed to execute {}: {}", cmd_path, e))
+        )?;
+        
+        if !output.status.success() {
+            return Err(NewbieError::new(&format!("Command failed with exit code: {}", 
+                output.status.code().unwrap_or(-1))));
+        }
+        
+    } else if !command.display_output {
+        std_cmd.stdout(Stdio::null())
+               .stderr(Stdio::null());
+        
+        let status = std_cmd.status().map_err(|e|
+            NewbieError::new(&format!("Failed to execute {}: {}", cmd_path, e))
+        )?;
+        
+        if !status.success() {
+            return Err(NewbieError::new(&format!("Command failed with exit code: {}", 
+                status.code().unwrap_or(-1))));
+        }
+        
+    } else {
+        let status = std_cmd.status().map_err(|e|
+            NewbieError::new(&format!("Failed to execute {}: {}", cmd_path, e))
+        )?;
+        
+        if !status.success() {
+            return Err(NewbieError::new(&format!("Command failed with exit code: {}", 
+                status.code().unwrap_or(-1))));
+        }
+    }
+    
+    if command.admin_mode {
+        let _ = StdCommand::new("sudo").arg("-k").status();
+    }
+    
+    Ok(())
+}
+
+// Command handlers
+fn handle_exit(_args: &[&str], command: &mut Command) -> Result<ExecutionResult, Box<dyn Error>> {
+    command.action = Some("exit".to_string());
+    Ok(ExecutionResult::Stop)
+}
+
+fn handle_show(args: &[&str], command: &mut Command) -> Result<ExecutionResult, Box<dyn Error>> {
+    command.display_output = true; // Enable output display
+    
+    // If no args, this is a &show modifier for other commands
+    if args.is_empty() {
+        return Ok(ExecutionResult::Continue);
+    }
+    
+    // If args present, this is a &show command for file display
+    command.action = Some("show".to_string());
+    let source_arg = args[0];
+    // Resolve variables for show command
+    if let Some((namespace, name)) = parse_variable_reference(source_arg) {
+        if let Some(value) = get_variable(namespace, &name) {
+            command.source = Some(value);
+        } else {
+            command.source = Some(source_arg.to_string());
+        }
+    } else {
+        command.source = Some(source_arg.to_string());
+    }
+    Ok(ExecutionResult::Stop)
+}
+
+fn handle_find(args: &[&str], command: &mut Command) -> Result<ExecutionResult, Box<dyn Error>> {
+    command.action = Some("find".to_string());
+    if !args.is_empty() {
+        command.source = Some(args[0].to_string());
+    }
+    Ok(ExecutionResult::Stop)
+}
+
+fn handle_copy(args: &[&str], command: &mut Command) -> Result<ExecutionResult, Box<dyn Error>> {
+    command.action = Some("copy".to_string());
+    if !args.is_empty() {
+        command.source = Some(args[0].to_string());
+    }
+    Ok(ExecutionResult::Stop)
+}
+
+fn handle_move(args: &[&str], command: &mut Command) -> Result<ExecutionResult, Box<dyn Error>> {
+    if args.len() != 1 {
+        return Err(NewbieError::new("&move requires exactly one source argument"));
+    }
+    
+    command.action = Some("move".to_string());
+    command.source = Some(args[0].to_string());
+    Ok(ExecutionResult::Stop)
+}
+
+fn handle_run(args: &[&str], command: &mut Command) -> Result<ExecutionResult, Box<dyn Error>> {
+    if args.is_empty() {
+        return Err(NewbieError::new("&run requires arguments"));
+    }
+    
+    command.action = Some("run".to_string());
+    
+    // Check for BASH syntax: &run BASH command
+    if args[0] == "BASH" {
+        if args.len() < 2 {
+            return Err(NewbieError::new("&run BASH requires a command"));
+        }
+        
+        // FIXED: Use iterator join instead of Vec for BASH command assembly
+        let mut bash_command = String::new();
+        for (i, &arg) in args[1..].iter().enumerate() {
+            if i > 0 {
+                bash_command.push(' ');
+            }
+            bash_command.push_str(arg);
+        }
+        command.bash_command = Some(bash_command);
+    } else {
+        // Single script/command path
+        if args.len() != 1 {
+            return Err(NewbieError::new("&run requires either 'BASH command' or single script path"));
+        }
+        command.source = Some(args[0].to_string());
+    }
+    
+    Ok(ExecutionResult::Stop)
+}
+
+fn handle_to(args: &[&str], command: &mut Command) -> Result<ExecutionResult, Box<dyn Error>> {
+    if args.len() != 1 {
+        return Err(NewbieError::new("&to requires exactly one destination argument"));
+    }
+    
+    command.destination = Some(args[0].to_string());
+    Ok(ExecutionResult::Continue)
+}
+
+fn handle_admin(_args: &[&str], command: &mut Command) -> Result<ExecutionResult, Box<dyn Error>> {
+    command.admin_mode = true;
+    Ok(ExecutionResult::Continue)
+}
+
+fn handle_global(args: &[&str], command: &mut Command) -> Result<ExecutionResult, Box<dyn Error>> {
+    command.display_output = true; // Global commands display output
+    
+    if args.is_empty() {
+        command.action = Some("global_list".to_string());
+        return Ok(ExecutionResult::Stop);
+    }
+    
+    if args.len() == 1 {
+        command.action = Some("global_get".to_string());
+        command.source = Some(args[0].to_string());
+        return Ok(ExecutionResult::Stop);
+    }
+    
+    if args.len() >= 2 {
+        let var_name = args[0];
+        // FIXED: Use iterator join instead of Vec for variable value assembly
+        let mut var_value = String::new();
+        for (i, &arg) in args[1..].iter().enumerate() {
+            if i > 0 {
+                var_value.push(' ');
+            }
+            var_value.push_str(arg);
+        }
+        
+        set_global_var(var_name, &var_value)?;
+        
+        if command.display_output && !command.raw_mode {
+            println!("Set global.{} = {}", var_name, var_value);
+        }
+        
+        command.action = Some("global_set".to_string());
+        return Ok(ExecutionResult::Stop);
+    }
+    
+    Err(NewbieError::new("&global usage: &global [varname] [value]"))
+}
+
+fn handle_set(args: &[&str], command: &mut Command) -> Result<ExecutionResult, Box<dyn Error>> {
+    if args.len() < 2 {
+        return Err(NewbieError::new("&set requires variable and value: &set &v.name value"));
+    }
+    
+    let var_ref = args[0];
+    
+    // FIXED: Use iterator join instead of Vec for variable value assembly
+    let var_value = if args.len() >= 3 && args[1] == "=" {
+        let mut value = String::new();
+        for (i, &arg) in args[2..].iter().enumerate() {
+            if i > 0 {
+                value.push(' ');
+            }
+            value.push_str(arg);
+        }
+        value
+    } else {
+        let mut value = String::new();
+        for (i, &arg) in args[1..].iter().enumerate() {
+            if i > 0 {
+                value.push(' ');
+            }
+            value.push_str(arg);
+        }
+        value
+    };
+    
+    if let Some((namespace, name)) = parse_variable_reference(var_ref) {
+        set_variable(namespace, &name, &var_value)?;
+        command.action = Some("set_variable".to_string());
+        command.source = Some(format!("{}={}", var_ref, var_value));
+    } else {
+        return Err(NewbieError::new(&format!("Invalid variable reference: {}", var_ref)));
+    }
+    
+    Ok(ExecutionResult::Stop)
+}
+
+fn handle_get(args: &[&str], command: &mut Command) -> Result<ExecutionResult, Box<dyn Error>> {
+    if args.len() != 1 {
+        return Err(NewbieError::new("&get requires one variable reference: &get &v.name"));
+    }
+    
+    command.display_output = true; // Get commands display output
+    
+    let var_ref = args[0];
+    
+    if let Some((namespace, name)) = parse_variable_reference(var_ref) {
+        command.action = Some("get_variable".to_string());
+        command.source = Some(var_ref.to_string());
+        
+        if let Some(value) = get_variable(namespace, &name) {
+            command.destination = Some(value);
+        }
+    } else {
+        return Err(NewbieError::new(&format!("Invalid variable reference: {}", var_ref)));
+    }
+    
+    Ok(ExecutionResult::Stop)
+}
+
+fn handle_vars(args: &[&str], command: &mut Command) -> Result<ExecutionResult, Box<dyn Error>> {
+    command.display_output = true; // Vars commands display output
+    
+    if args.is_empty() {
+        command.action = Some("list_all_variables".to_string());
+    } else {
+        let namespace_name = args[0];
+        command.action = Some("list_namespace_variables".to_string());
+        command.source = Some(namespace_name.to_string());
+    }
+    
+    Ok(ExecutionResult::Stop)
+}
+
+fn handle_first(args: &[&str], command: &mut Command) -> Result<ExecutionResult, Box<dyn Error>> {
+    if let Some(arg) = args.get(0) {
+        if let Ok(n) = arg.parse::<usize>() {
+            command.first_n = Some(n);
+        } else {
+            return Err(NewbieError::new("&first requires a number"));
+        }
+    } else {
+        return Err(NewbieError::new("&first requires a number argument"));
+    }
+    
+    Ok(ExecutionResult::Continue)
+}
+
+fn handle_last(args: &[&str], command: &mut Command) -> Result<ExecutionResult, Box<dyn Error>> {
+    if let Some(arg) = args.get(0) {
+        if let Ok(n) = arg.parse::<usize>() {
+            command.last_n = Some(n);
+        } else {
+            return Err(NewbieError::new("&last requires a number"));
+        }
+    } else {
+        return Err(NewbieError::new("&last requires a number argument"));
+    }
+    
+    Ok(ExecutionResult::Continue)
+}
+
+fn handle_lines(_args: &[&str], command: &mut Command) -> Result<ExecutionResult, Box<dyn Error>> {
+    command.current_unit = LineOrChar::Lines;
+    Ok(ExecutionResult::Continue)
+}
+
+fn handle_chars(_args: &[&str], command: &mut Command) -> Result<ExecutionResult, Box<dyn Error>> {
+    command.current_unit = LineOrChar::Chars;
+    Ok(ExecutionResult::Continue)
+}
+
+fn handle_numbered(_args: &[&str], command: &mut Command) -> Result<ExecutionResult, Box<dyn Error>> {
+    command.numbered = true;
+    Ok(ExecutionResult::Continue)
+}
+
+fn handle_original_numbers(_args: &[&str], command: &mut Command) -> Result<ExecutionResult, Box<dyn Error>> {
+    command.original_numbers = true;
+    Ok(ExecutionResult::Continue)
+}
+
+fn handle_raw(_args: &[&str], command: &mut Command) -> Result<ExecutionResult, Box<dyn Error>> {
+    command.raw_mode = true;
+    Ok(ExecutionResult::Continue)
+}
+
+fn handle_delete(args: &[&str], command: &mut Command) -> Result<ExecutionResult, Box<dyn Error>> {
+    if args.len() != 1 {
+        return Err(NewbieError::new("&delete requires exactly one path argument"));
+    }
+    
+    command.action = Some("delete".to_string());
+    command.source = Some(args[0].to_string());
+    Ok(ExecutionResult::Stop)
+}
+
+fn execute_delete_command(file_path: &str, command: &Command) -> Result<(), Box<dyn Error>> {
+    let expanded_path = expand_tilde(file_path);
+    let path = Path::new(&expanded_path);
+    
+    if !path.exists() {
+        return Err(NewbieError::new(&format!("Path not found: {}", expanded_path)));
+    }
+    
+    if command.admin_mode {
+        let mut sudo_cmd = StdCommand::new("sudo");
+        sudo_cmd.arg("rm").arg("-rf").arg(&expanded_path);
+        
+        if !command.display_output {
+            sudo_cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+        
+        let status = sudo_cmd.status().map_err(|e|
+            NewbieError::new(&format!("Failed to execute sudo rm: {}", e))
+        )?;
+        
+        if !status.success() {
+            return Err(NewbieError::new(&format!("Delete failed with exit code: {}", 
+                status.code().unwrap_or(-1))));
+        }
+        
+        let _ = StdCommand::new("sudo").arg("-k").status();
+    } else {
+        if path.is_dir() {
+            fs::remove_dir_all(&expanded_path).map_err(|e|
+                NewbieError::new(&format!("Failed to delete directory {}: {}", expanded_path, e))
+            )?;
+        } else {
+            fs::remove_file(&expanded_path).map_err(|e|
+                NewbieError::new(&format!("Failed to delete file {}: {}", expanded_path, e))
+            )?;
+        }
+    }
+    
+    if command.display_output && !command.raw_mode {
+        println!("Deleted {}", file_path);
+    }
+    
+    Ok(())
+}
+
+// Main interactive loop
+fn main() -> Result<(), Box<dyn Error>> {
+    println!("Newbie Shell v0.4.1 - BASH Support & Silent Execution");
+    println!("Type '&exit' to quit");
+    println!("Examples:");
+    println!("  &run BASH echo 'Hello World'    # Execute bash command");
+    let stdin = io::stdin();
+    println!("  &show &run BASH ls -la           # Execute and display output");
+    println!("  &show src/main.rs &first 10      # Show first 10 lines");
+    println!("  &run script.sh                   # Execute script silently");
+    
+    loop {
+        print!("newbie> ");
+        io::Write::flush(&mut io::stdout())?;
+        
+        let mut line = String::new();
+        match stdin.read_line(&mut line) {
+            Ok(0) => break, // EOF
+            Ok(_) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                
+                // Parse and execute the line
+                if let Err(e) = parse_and_execute_line(trimmed) {
+                    println!("Error: {}", e);
+                }
+            }
+            Err(e) => {
+                println!("Error reading input: {}", e);
+                break;
+            }
+        }
+    }
+    
+    Ok(())
+}

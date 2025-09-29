@@ -1,0 +1,10 @@
+2024-01-15 INFO System startup complete
+2024-01-15 WARN Low disk space detected
+2024-01-15 ERROR Failed to connect to database
+2024-01-15 INFO User login: alice
+2024-01-15 ERROR   1234 Connection timeout
+2024-01-15 DEBUG Processing request #5671
+2024-01-15 ERROR   5678 Authentication failed
+Normal log entry without errors
+Another info message
+2024-01-15 ERROR   9999 Service unavailable

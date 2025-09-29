@@ -1,0 +1,5 @@
+<http://www.wikidata.org/entity/Q31> <http://www.wikidata.org/prop/direct/P1549> "Belgian"@en .
+<http://www.wikidata.org/entity/Q31> <http://www.w3.org/2000/01/rdf-schema#label> "Belgium"@en-gb .
+<http://www.wikidata.org/entity/Q31> <http://www.w3.org/2004/02/skos/core#prefLabel> "Belgium"@en-gb .
+<http://www.wikidata.org/entity/Q31> <http://schema.org/name> "Belgium"@en-gb .
+<http://www.wikidata.org/entity/Q31> <http://www.w3.org/2000/01/rdf-schema#label> "Belgium"@en .
