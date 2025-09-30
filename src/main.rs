@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::fs::File;
 use std::path::Path;
 use std::process::{Command as StdCommand, Stdio};
@@ -11,9 +11,21 @@ use std::env;
 use std::process;
 use std::net::TcpStream;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::mpsc;
+use std::thread;
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 use std::path::PathBuf;
+
+// Optional decompression crates are behind the `compression` feature in Cargo.toml
+#[cfg(feature = "compression")]
+use flate2::read::GzDecoder;
+#[cfg(feature = "compression")]
+use bzip2::read::BzDecoder;
+#[cfg(feature = "compression")]
+use xz2::read::XzDecoder;
+#[cfg(feature = "compression")]
+use zstd::stream::read::Decoder as ZstdDecoder;
 
 
 // CRITICAL MEMORY CONSTRAINT: NEVER use Vec for data processing!
@@ -1006,17 +1018,61 @@ fn execute_bash_command(bash_cmd: &str, command: &Command) -> Result<(), Box<dyn
 
 // &show command implementation with streaming architecture
 fn execute_show_command(file_path: &str, command: &Command) -> Result<(), Box<dyn Error>> {
-    let file = File::open(file_path).map_err(|e|
+    // Open file and peek magic bytes to detect compression
+    let mut file = File::open(file_path).map_err(|e|
         NewbieError::new(&format!("Failed to open file {}: {}", file_path, e))
     )?;
-    
+
+    // Read first few bytes to detect magic
+    let mut magic: [u8; 6] = [0; 6];
+    let bytes_read = file.read(&mut magic)?;
+    // Reset seek to start for actual reading
+    file.seek(SeekFrom::Start(0))?;
+
+    // Decide whether to use a reader thread that can handle decompression
+    let use_threaded_reader = match bytes_read {
+        0 => false,
+        _ => {
+            // gzip: 1F 8B, bzip2: 42 5A 68 (BZh), xz: FD 37 7A 58 5A 00, zstd: 28 B5 2F FD
+            if magic.starts_with(&[0x1F, 0x8B]) {
+                true
+            } else if magic.starts_with(&[0x42, 0x5A, 0x68]) {
+                true
+            } else if magic.starts_with(&[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00]) {
+                true
+            } else if magic.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+                true
+            } else {
+                false
+            }
+        }
+    };
+
+    if use_threaded_reader {
+        // Spawn a reader thread that will stream up to 1024 lines into a bounded channel
+        let receiver = spawn_reader_thread(file_path.to_string())?;
+
+        // Character-based operations aren't supported via threaded reader yet
+        if matches!(command.current_unit, LineOrChar::Chars) {
+            return Err(NewbieError::new("Character-based streaming not supported for compressed files"));
+        }
+
+        if let Some(first_n) = command.first_n {
+            return execute_show_first_lines_from_receiver(receiver, first_n, command);
+        } else if let Some(last_n) = command.last_n {
+            return execute_show_last_lines_from_receiver(receiver, last_n, command);
+        } else {
+            return execute_show_all_lines_from_receiver(receiver, command);
+        }
+    }
+
     let reader = BufReader::new(file);
-    
+
     // Handle character-based operations with streaming
     if matches!(command.current_unit, LineOrChar::Chars) {
         return execute_show_chars(reader, command);
     }
-    
+
     // Handle line-based operations with streaming
     if let Some(first_n) = command.first_n {
         execute_show_first_lines(reader, first_n, command)
@@ -1025,6 +1081,174 @@ fn execute_show_command(file_path: &str, command: &Command) -> Result<(), Box<dy
     } else {
         execute_show_all_lines(reader, command)
     }
+}
+
+// Spawn a reader thread that detects compression and sends lines over a bounded channel
+fn spawn_reader_thread(path: String) -> Result<mpsc::Receiver<String>, Box<dyn Error>> {
+    let (tx, rx) = mpsc::sync_channel::<String>(1024);
+
+    // Clone path for move into thread
+    let thread_path = path.clone();
+
+    thread::spawn(move || {
+        // Open file inside thread
+        let file = match File::open(&thread_path) {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = tx.send(format!("__ERROR__ Failed to open file {}: {}", thread_path, e));
+                return;
+            }
+        };
+
+        // Peek magic bytes
+        let mut buf = [0u8; 6];
+        let mut reader_for_magic = file;
+        let _ = reader_for_magic.read_exact(&mut buf).ok();
+        // Re-open file for actual reading (simpler than seeking on various readers)
+        let file = match File::open(&thread_path) {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = tx.send(format!("__ERROR__ Failed to reopen file {}: {}", thread_path, e));
+                return;
+            }
+        };
+
+        // Create a boxed reader that implements BufRead. Use compression decoders only when
+        // the `compression` feature is enabled.
+        #[cfg(feature = "compression")]
+        let boxed_reader: Box<dyn BufRead> = {
+            if buf.starts_with(&[0x1F, 0x8B]) {
+                // gzip
+                let f = File::open(&thread_path).unwrap();
+                let gz = GzDecoder::new(f);
+                Box::new(BufReader::new(gz))
+            } else if buf.starts_with(&[0x42, 0x5A, 0x68]) {
+                // bzip2
+                let f = File::open(&thread_path).unwrap();
+                let bz = BzDecoder::new(f);
+                Box::new(BufReader::new(bz))
+            } else if buf.starts_with(&[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00]) {
+                // xz
+                let f = File::open(&thread_path).unwrap();
+                let xz = XzDecoder::new(f);
+                Box::new(BufReader::new(xz))
+            } else if buf.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+                // zstd
+                let f = File::open(&thread_path).unwrap();
+                match ZstdDecoder::new(f) {
+                    Ok(dec) => Box::new(BufReader::new(dec)),
+                    Err(_) => {
+                        let f2 = File::open(&thread_path).unwrap();
+                        Box::new(BufReader::new(f2))
+                    }
+                }
+            } else {
+                let f = File::open(&thread_path).unwrap();
+                Box::new(BufReader::new(f))
+            }
+        };
+
+        #[cfg(not(feature = "compression"))]
+        let boxed_reader: Box<dyn BufRead> = {
+            let f = File::open(&thread_path).unwrap();
+            Box::new(BufReader::new(f))
+        };
+
+        // Stream lines into channel, stop if send fails (receiver dropped)
+        for line_result in boxed_reader.lines() {
+            match line_result {
+                Ok(line) => {
+                    if tx.send(line).is_err() {
+                        // Receiver dropped; stop thread
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(format!("__ERROR__ Failed to read line: {}", e));
+                    break;
+                }
+            }
+        }
+    });
+
+    Ok(rx)
+}
+
+// Consume receiver to display first N lines
+fn execute_show_first_lines_from_receiver(rx: mpsc::Receiver<String>, first_n: usize, command: &Command) -> Result<(), Box<dyn Error>> {
+    let mut printed = 0usize;
+    while printed < first_n {
+        match rx.recv() {
+            Ok(line) => {
+                if line.starts_with("__ERROR__") {
+                    return Err(NewbieError::new(&line));
+                }
+                if command.numbered {
+                    println!("{:6}: {}", printed + 1, line);
+                } else if command.original_numbers {
+                    println!("{:6}: {}", printed + 1, line);
+                } else {
+                    println!("{}", line);
+                }
+                printed += 1;
+            }
+            Err(_) => break, // channel closed
+        }
+    }
+    Ok(())
+}
+
+// Consume receiver to display last N lines using circular buffer (bounded by N)
+fn execute_show_last_lines_from_receiver(rx: mpsc::Receiver<String>, last_n: usize, command: &Command) -> Result<(), Box<dyn Error>> {
+    if last_n > MAX_LAST_LINES {
+        return Err(NewbieError::new(&format!("&last {} exceeds maximum of {}", last_n, MAX_LAST_LINES)));
+    }
+
+    let mut buf: Vec<String> = Vec::with_capacity(last_n);
+    for received in rx.iter() {
+        if received.starts_with("__ERROR__") {
+            return Err(NewbieError::new(&received));
+        }
+        if buf.len() < last_n {
+            buf.push(received);
+        } else {
+            // rotate
+            buf.remove(0);
+            buf.push(received);
+        }
+    }
+
+    // Print buffer
+    let total = buf.len();
+    let start_line = if total > last_n { total - last_n + 1 } else { 1 };
+    for (i, line) in buf.into_iter().enumerate() {
+        if command.numbered {
+            println!("{:6}: {}", i + 1, line);
+        } else if command.original_numbers {
+            println!("{:6}: {}", start_line + i, line);
+        } else {
+            println!("{}", line);
+        }
+    }
+
+    Ok(())
+}
+
+// Consume receiver and print all lines until channel closes
+fn execute_show_all_lines_from_receiver(rx: mpsc::Receiver<String>, command: &Command) -> Result<(), Box<dyn Error>> {
+    let mut line_no = 1usize;
+    for received in rx.iter() {
+        if received.starts_with("__ERROR__") {
+            return Err(NewbieError::new(&received));
+        }
+        if command.numbered || command.original_numbers {
+            println!("{:6}: {}", line_no, received);
+        } else {
+            println!("{}", received);
+        }
+        line_no += 1;
+    }
+    Ok(())
 }
 
 // Streaming character-based display
@@ -1541,8 +1765,12 @@ fn handle_find(args: &[&str], command: &mut Command) -> Result<ExecutionResult, 
 
 fn handle_copy(args: &[&str], command: &mut Command) -> Result<ExecutionResult, Box<dyn Error>> {
     command.action = Some("copy".to_string());
-    if !args.is_empty() {
+    // Support both: `&copy source` and `&copy source destination`
+    if args.len() >= 1 {
         command.source = Some(args[0].to_string());
+    }
+    if args.len() >= 2 {
+        command.destination = Some(args[1].to_string());
     }
     Ok(ExecutionResult::Stop)
 }
