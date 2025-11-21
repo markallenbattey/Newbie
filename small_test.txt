@@ -1,3 +1,0 @@
-"test1"@en .
-"test2"@en .
-"test3"@en .
