@@ -1,0 +1,86 @@
+.TH NEWBIE 1 "December 2024" "newbie 1.0.5" "User Commands"
+.SH NAME
+newbie \- natural language shell interpreter and text processor
+.SH SYNOPSIS
+.B newbie
+.RI [ script.ns ]
+.SH DESCRIPTION
+.B Newbie
+is a natural language shell interpreter that eliminates traditional shell
+complexity through universal ampersand prefixes (&command syntax) and
+delimiter-free parsing. Designed for text processing tasks without requiring
+knowledge of regex, sed, or grep.
+.PP
+All commands start with
+.BR & ,
+and content runs from one &keyword to the next, eliminating the need for
+string delimiters or escape characters. This makes it exceptionally powerful
+for bulk text modification.
+.PP
+Newbie uses streaming file processing with fixed-size buffers, allowing it
+to handle very large files without memory explosion.
+.SH OPTIONS
+.TP
+.I script.ns
+Run the specified Newbie script file. Without arguments, starts interactive mode.
+.SH COMMANDS
+.TP
+.B &help
+Display interactive help system
+.TP
+.B &guide
+Display the full user guide
+.TP
+.B &show \fIfile\fR
+Display file contents (paginated for humans)
+.TP
+.B &find \fIpattern\fR &in \fIfile\fR
+Search for pattern in file using readable pattern language
+.TP
+.B &copy \fIsource\fR &to \fIdest\fR
+Copy files (uses rsync)
+.TP
+.B &write \fItext\fR &to \fIfile\fR
+Append text to file
+.TP
+.B &exit
+Exit Newbie
+.SH EXAMPLES
+Show a file:
+.PP
+.RS
+&show myfile.txt
+.RE
+.PP
+Show first 10 lines:
+.PP
+.RS
+&show myfile.txt &first 10
+.RE
+.PP
+Find lines containing "error":
+.PP
+.RS
+&show &find error &in logfile.txt
+.RE
+.PP
+Copy with compression:
+.PP
+.RS
+&convert data.txt &into data.zst
+.RE
+.SH FILES
+.TP
+.I ~/.newbie_history
+Command history for interactive mode
+.SH SEE ALSO
+The built-in
+.B &guide
+command provides comprehensive documentation.
+.PP
+Project homepage:
+.I https://github.com/markallenbattey/Newbie
+.SH AUTHOR
+Mark Allen Battey
+.SH LICENSE
+MIT
