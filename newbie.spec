@@ -5,7 +5,7 @@
 %global cargo_install_lib 0
 
 Name:           newbie
-Version:        1.0.6
+Version:        1.0.8
 Release:        %autorelease
 Summary:        Natural language shell interpreter and text processor
 
